@@ -38,9 +38,12 @@ simulée.
 
 Les handshakes TLS 1.3 standards produisent des signatures **transférables** :
 le message `CertificateVerify` du serveur est une signature Ed25519 (ou ECDSA)
-standard du hash de transcription. Quiconque capture cette signature peut
-prouver à un tiers que le serveur a authentifié une session spécifique — un
-problème pour les applications sensibles à la vie privée (ex. : lanceurs
+standard du hash de transcription. Bien que TLS 1.3 chiffre tous les messages
+après ServerHello (RFC 8446 §4.2.3) — protégeant CertificateVerify contre
+l'interception passive sur le réseau — une divulgation ultérieure du transcript
+(compromission d'endpoint, journalisation applicative, révélation volontaire)
+permet à un tiers de présenter cette signature comme preuve d'authentification.
+C'est un problème pour les applications sensibles à la vie privée (ex. : lanceurs
 d'alerte, soins de santé, services financiers).
 
 DVNIZK-ECC remplace la signature déterministe par une **preuve à divulgation
