@@ -43,6 +43,8 @@ from .handshakehelpers import HandshakeHelpers
 from .utils.cipherfactory import createAESCCM, createAESCCM_8, \
         createAESGCM, createCHACHA20
 from .utils.compression import choose_compression_send_algo
+from . import dvnizk
+
 
 
 class TLSConnection(TLSRecordLayer):
@@ -1434,6 +1436,7 @@ class TLSConnection(TLSRecordLayer):
 
             srv_cert_verify_hh = self._handshake_hash.copy()
 
+            # Get CertificateVerify and then decide how to verify
             for result in self._getMsg(ContentType.handshake,
                                        HandshakeType.certificate_verify):
                 if result in (0, 1):
@@ -1444,14 +1447,8 @@ class TLSConnection(TLSRecordLayer):
             assert isinstance(certificate_verify, CertificateVerify)
 
             signature_scheme = certificate_verify.signatureAlgorithm
-            self.serverSigAlg = signature_scheme
 
-            signature_context = KeyExchange.calcVerifyBytes((3, 4),
-                                                            srv_cert_verify_hh,
-                                                            signature_scheme,
-                                                            None, None, None,
-                                                            prfName, b'server')
-
+            # Get the server's public key for all verification methods
             for result in self._clientGetKeyFromChain(certificate, settings):
                 if result in (0, 1):
                     yield result
@@ -1459,80 +1456,128 @@ class TLSConnection(TLSRecordLayer):
                     break
             publicKey, serverCertChain, tackExt = result
 
-            cert_entry = certificate.certificate_list[0]
-            cert_ext = None
-            del_cred_list = []
-            for ext in cert_entry.extensions:
-                if isinstance(ext, DelegatedCredentialCertExtension):
-                    del_cred_list.append(ext)
-                    cert_ext = ext
-            if len(del_cred_list) > 1:
-                for result in self._sendError(
-                        AlertDescription.illegal_parameter,
-                        "The server sent multiple delegated credentials "\
-                        "extensions in a single CertificateEntry."):
-                    yield result
+            if signature_scheme == SignatureScheme.dvnizk_ed25519:
+                    # === DVNIZK-ECC Proof Verification ===
+                    self.serverSigAlg = SignatureScheme.dvnizk_ed25519
+                    try:
+                        proof_obj = dvnizk.deserialize_proof(
+                            certificate_verify.signature)
 
-            if cert_ext:
-                if not settings.dc_sig_algs:
-                    for result in self._sendError(
-                            AlertDescription.unexpected_message,
-                            "The server provided delegated credential, "\
-                            "when client does not support it."):
-                        yield result
+                        # Get server's public key (Ed25519 raw bytes)
+                        p_server = bytes(publicKey.public_key.to_string())
 
-                if not cert_ext.delegated_credential.verify(
-                        cert_entry,
-                        clientHello,
-                        certificate_verify):
-                    raise TLSDecryptionFailed("server Delegated Credential " \
-                                              "verification failed.")
-                delegated_credential = cert_ext.delegated_credential
-                publicKey = delegated_credential.cred.pub_key
-                signature_scheme = delegated_credential.cred.dc_cert_verify_algorithm
+                        # Get client's ephemeral public key
+                        p_client_raw = kex.calc_public_value(cl_kex.private)
+                        if self.ecdhCurve == GroupName.x25519:
+                            p_client = dvnizk.x25519_to_ed25519(p_client_raw)
+                        else:
+                            p_client = p_client_raw
 
-            if signature_scheme in (SignatureScheme.ed25519,
-                                    SignatureScheme.ed448,
-                                    SignatureScheme.mldsa44,
-                                    SignatureScheme.mldsa65,
-                                    SignatureScheme.mldsa87):
-                pad_type = None
-                hash_name = "intrinsic"
-                salt_len = None
-                method = publicKey.hashAndVerify
-            elif signature_scheme[1] == SignatureAlgorithm.ecdsa:
-                pad_type = None
-                hash_name = HashAlgorithm.toRepr(signature_scheme[0])
-                matching_hash = curve_name_to_hash_name(
-                    publicKey.curve_name)
-                if hash_name != matching_hash:
-                    raise TLSIllegalParameterException(
-                        "server selected signature method invalid for the "\
-                        "certificate it presented (curve mismatch)")
+                        # Get transcript hash
+                        transcript_hash = srv_cert_verify_hh.digest(prfName)
 
-                salt_len = None
-                method = publicKey.verify
-            elif signature_scheme in TLS_1_3_BRAINPOOL_SIG_SCHEMES:
-                scheme = SignatureScheme.toRepr(signature_scheme)
-                pad_type = None
-                hash_name = SignatureScheme.getHash(scheme)
-                salt_len = None
-                method = publicKey.verify
+                        # Verify the proof
+                        valid, _ = dvnizk.verify_proof(
+                            proof_obj,
+                            p_server,
+                            p_client,
+                            transcript_hash
+                        )
+                        if not valid:
+                            raise TLSDecryptionFailed(
+                                "DVNIZK-ECC proof verification failed")
+                    except Exception:
+                        # Broad exception to catch any error during proof
+                        # verification and treat it as a handshake failure.
+                        for result in self._sendError(
+                                AlertDescription.decrypt_error,
+                                "DVNIZK-ECC proof verification failed"):
+                            yield result
+                        raise
             else:
-                scheme = SignatureScheme.toRepr(signature_scheme)
-                pad_type = SignatureScheme.getPadding(scheme)
-                hash_name = SignatureScheme.getHash(scheme)
-                salt_len = getattr(hashlib, hash_name)().digest_size
-                method = publicKey.verify
+                    # === Standard Signature-based CertificateVerify ===
+                    self.serverSigAlg = signature_scheme
 
-            if not method(certificate_verify.signature,
-                          signature_context,
-                          pad_type,
-                          hash_name,
-                          salt_len):
-                raise TLSDecryptionFailed("server Certificate Verify "
-                                          "signature "
-                                          "verification failed")
+                    signature_context = KeyExchange.calcVerifyBytes((3, 4),
+                                                                    srv_cert_verify_hh,
+                                                                    signature_scheme,
+                                                                    None, None, None,
+                                                                    prfName, b'server')
+
+                    cert_entry = certificate.certificate_list[0]
+                    cert_ext = None
+                    del_cred_list = []
+                    for ext in cert_entry.extensions:
+                        if isinstance(ext, DelegatedCredentialCertExtension):
+                            del_cred_list.append(ext)
+                            cert_ext = ext
+                    if len(del_cred_list) > 1:
+                        for result in self._sendError(
+                                AlertDescription.illegal_parameter,
+                                "The server sent multiple delegated credentials "\
+                                "extensions in a single CertificateEntry."):
+                            yield result
+
+                    if cert_ext:
+                        if not settings.dc_sig_algs:
+                            for result in self._sendError(
+                                    AlertDescription.unexpected_message,
+                                    "The server provided delegated credential, "\
+                                    "when client does not support it."):
+                                yield result
+
+                        if not cert_ext.delegated_credential.verify(
+                                cert_entry,
+                                clientHello,
+                                certificate_verify):
+                            raise TLSDecryptionFailed("server Delegated Credential " \
+                                                      "verification failed.")
+                        delegated_credential = cert_ext.delegated_credential
+                        publicKey = delegated_credential.cred.pub_key
+                        signature_scheme = delegated_credential.cred.dc_cert_verify_algorithm
+
+                    if signature_scheme in (SignatureScheme.ed25519,
+                                            SignatureScheme.ed448,
+                                            SignatureScheme.mldsa44,
+                                            SignatureScheme.mldsa65,
+                                            SignatureScheme.mldsa87):
+                        pad_type = None
+                        hash_name = "intrinsic"
+                        salt_len = None
+                        method = publicKey.hashAndVerify
+                    elif signature_scheme[1] == SignatureAlgorithm.ecdsa:
+                        pad_type = None
+                        hash_name = HashAlgorithm.toRepr(signature_scheme[0])
+                        matching_hash = curve_name_to_hash_name(
+                            publicKey.curve_name)
+                        if hash_name != matching_hash:
+                            raise TLSIllegalParameterException(
+                                "server selected signature method invalid for the "\
+                                "certificate it presented (curve mismatch)")
+
+                        salt_len = None
+                        method = publicKey.verify
+                    elif signature_scheme in TLS_1_3_BRAINPOOL_SIG_SCHEMES:
+                        scheme = SignatureScheme.toRepr(signature_scheme)
+                        pad_type = None
+                        hash_name = SignatureScheme.getHash(scheme)
+                        salt_len = None
+                        method = publicKey.verify
+                    else:
+                        scheme = SignatureScheme.toRepr(signature_scheme)
+                        pad_type = SignatureScheme.getPadding(scheme)
+                        hash_name = SignatureScheme.getHash(scheme)
+                        salt_len = getattr(hashlib, hash_name)().digest_size
+                        method = publicKey.verify
+
+                    if not method(certificate_verify.signature,
+                                  signature_context,
+                                  pad_type,
+                                  hash_name,
+                                  salt_len):
+                        raise TLSDecryptionFailed("server Certificate Verify "
+                                                  "signature "
+                                                  "verification failed")
 
         transcript_hash = self._handshake_hash.digest(prfName)
 
@@ -3144,61 +3189,94 @@ class TLSConnection(TLSRecordLayer):
                 self.version, extensions)
             self._queue_message(certificate)
 
-            certificate_verify = CertificateVerify(self.version)
+            if scheme == "dvnizk_ed25519":
+                # === DVNIZK-ECC Proof Generation ===
+                certificate_verify = CertificateVerify(self.version)
+                self.serverSigAlg = SignatureScheme.dvnizk_ed25519
 
-            if delegated_credential and dc_sig_scheme:
-                privateKey = dc_key
-                signature_scheme = dc_sig_scheme
-                scheme = SignatureScheme.toRepr(signature_scheme)
+                # Get client's ephemeral public key from key_share
+                share = clientHello.getExtension(ExtensionType.key_share)
+                cl_key_share = share.client_shares[0]
+                p_client_raw = cl_key_share.key_exchange
 
-            signature_scheme = getattr(SignatureScheme, scheme)
-            self.serverSigAlg = signature_scheme
-            signature_context = \
-                KeyExchange.calcVerifyBytes((3, 4), self._handshake_hash,
-                                            signature_scheme, None, None, None,
-                                            prf_name, b'server')
-            if signature_scheme in (SignatureScheme.ed25519,
-                    SignatureScheme.ed448, SignatureScheme.mldsa44,
-                    SignatureScheme.mldsa65, SignatureScheme.mldsa87):
-                hashName = "intrinsic"
-                padType = None
-                saltLen = None
-                sig_func = privateKey.hashAndSign
-                ver_func = privateKey.hashAndVerify
-            elif signature_scheme[1] == SignatureAlgorithm.ecdsa:
-                hashName = HashAlgorithm.toRepr(signature_scheme[0])
-                padType = None
-                saltLen = None
-                sig_func = privateKey.sign
-                ver_func = privateKey.verify
-            elif signature_scheme in TLS_1_3_BRAINPOOL_SIG_SCHEMES:
-                hashName = SignatureScheme.getHash(scheme)
-                padType = None
-                saltLen = None
-                sig_func = privateKey.sign
-                ver_func = privateKey.verify
+                # Convertir X25519 → Ed25519 si nécessaire (birational equivalence)
+                # X25519 u-coordinate → Ed25519 y-coordinate
+                if self.ecdhCurve == GroupName.x25519:
+                    p_client = dvnizk.x25519_to_ed25519(p_client_raw)
+                else:
+                    p_client = p_client_raw
+
+                # Get server's Ed25519 private scalar and public key
+                x_server, p_server_bytes = dvnizk.eddsakey_to_scalar_and_pub(privateKey)
+                p_server = p_server_bytes
+
+                # Get transcript hash
+                transcript_hash = self._handshake_hash.digest(prf_name)
+
+                # Generate the proof
+                proof_obj = dvnizk.generate_proof(
+                    x_server,
+                    p_server,
+                    p_client,
+                    transcript_hash
+                )
+                proof_bytes = dvnizk.serialize_proof(proof_obj)
+
+                certificate_verify.create(proof_bytes,
+                                          SignatureScheme.dvnizk_ed25519)
+                self._queue_message(certificate_verify)
             else:
-                padType = SignatureScheme.getPadding(scheme)
-                hashName = SignatureScheme.getHash(scheme)
-                saltLen = getattr(hashlib, hashName)().digest_size
-                sig_func = privateKey.sign
-                ver_func = privateKey.verify
+                # === Standard Signature-based CertificateVerify ===
+                certificate_verify = CertificateVerify(self.version)
 
-            signature = sig_func(signature_context,
-                                 padType,
-                                 hashName,
-                                 saltLen)
-            if not ver_func(signature, signature_context,
-                            padType,
-                            hashName,
-                            saltLen):
-                for result in self._sendError(
-                        AlertDescription.internal_error,
-                        "Certificate Verify signature failed"):
-                    yield result
-            certificate_verify.create(signature, signature_scheme)
+                signature_scheme = getattr(SignatureScheme, scheme)
+                self.serverSigAlg = signature_scheme
+                signature_context = \
+                    KeyExchange.calcVerifyBytes((3, 4), self._handshake_hash,
+                                                signature_scheme, None, None, None,
+                                                prf_name, b'server')
+                if signature_scheme in (SignatureScheme.ed25519,
+                        SignatureScheme.ed448, SignatureScheme.mldsa44,
+                        SignatureScheme.mldsa65, SignatureScheme.mldsa87):
+                    hashName = "intrinsic"
+                    padType = None
+                    saltLen = None
+                    sig_func = privateKey.hashAndSign
+                    ver_func = privateKey.hashAndVerify
+                elif signature_scheme[1] == SignatureAlgorithm.ecdsa:
+                    hashName = HashAlgorithm.toRepr(signature_scheme[0])
+                    padType = None
+                    saltLen = None
+                    sig_func = privateKey.sign
+                    ver_func = privateKey.verify
+                elif signature_scheme in TLS_1_3_BRAINPOOL_SIG_SCHEMES:
+                    hashName = SignatureScheme.getHash(scheme)
+                    padType = None
+                    saltLen = None
+                    sig_func = privateKey.sign
+                    ver_func = privateKey.verify
+                else:
+                    padType = SignatureScheme.getPadding(scheme)
+                    hashName = SignatureScheme.getHash(scheme)
+                    saltLen = getattr(hashlib, hashName)().digest_size
+                    sig_func = privateKey.sign
+                    ver_func = privateKey.verify
 
-            self._queue_message(certificate_verify)
+                signature = sig_func(signature_context,
+                                     padType,
+                                     hashName,
+                                     saltLen)
+                if not ver_func(signature, signature_context,
+                                padType,
+                                hashName,
+                                saltLen):
+                    for result in self._sendError(
+                            AlertDescription.internal_error,
+                            "Certificate Verify signature failed"):
+                        yield result
+                certificate_verify.create(signature, signature_scheme)
+
+                self._queue_message(certificate_verify)
 
         finished_key = HKDF_expand_label(sr_handshake_traffic_secret,
                                          b"finished", b'', prf_size, prf_name)
@@ -5107,7 +5185,8 @@ class TLSConnection(TLSRecordLayer):
                     # EdDSA is supported only in TLS 1.2 and 1.3
                     continue
                 if certType and sig_scheme != certType:
-                    continue
+                    if not (certType == "Ed25519" and sig_scheme == "dvnizk_ed25519"):
+                        continue
                 # the special brainpool sig schemes are TLS 1.3 only
                 # in TLS 1.2 we use general "ECDSA" sig schemes
                 if version < (3, 4) and 'brainpool' in sig_scheme:

@@ -263,6 +263,10 @@ class SignatureScheme(TLSEnum):
     dsa_sha384 = (5, 2)
     dsa_sha512 = (6, 2)
 
+    # DVNIZK-ECC proof scheme for deniable authentication
+    # Private use range (0xFE00)
+    dvnizk_ed25519 = (254, 0)
+
     @classmethod
     def toRepr(cls, value, blacklist=None):
         """Convert numeric type to name representation"""
@@ -280,7 +284,7 @@ class SignatureScheme(TLSEnum):
 
         E.g. for "rsa_pkcs1_sha1" it returns "rsa"
         """
-        if scheme in ("ed25519", "ed448"):
+        if scheme in ("ed25519", "ed448", "dvnizk_ed25519"):
             return "eddsa"
         if "mldsa" in scheme:
             return "mldsa"
