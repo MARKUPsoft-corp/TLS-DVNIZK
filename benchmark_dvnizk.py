@@ -30,8 +30,8 @@ from tlslite.x509certchain import X509CertChain
 from tlslite.utils.keyfactory import parsePEMKey
 from tlslite.constants import SignatureScheme
 
-CERT_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'dvnizk_ecc', 'certs', 'server.crt')
-KEY_PATH  = os.path.join(os.path.dirname(__file__), '..', '..', 'dvnizk_ecc', 'certs', 'server.key')
+CERT_PATH = os.path.join(os.path.dirname(__file__), 'dvnizk_ecc', 'certs', 'server.crt')
+KEY_PATH  = os.path.join(os.path.dirname(__file__), 'dvnizk_ecc', 'certs', 'server.key')
 
 SEP = "=" * 68
 N_DEFAULT = 100

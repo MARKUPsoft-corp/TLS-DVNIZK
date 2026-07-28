@@ -16,8 +16,8 @@ from tlslite.constants import SignatureScheme, AlertDescription
 from tlslite.errors import TLSError  # Correction: TLSError au lieu de TLSHandshakeError
 
 # Paths are now relative to the project root directory
-CERT_PATH = 'dvnizk_ecc/certs/server.crt'
-KEY_PATH = 'dvnizk_ecc/certs/server.key'
+CERT_PATH = os.path.join(os.path.dirname(__file__), 'dvnizk_ecc', 'certs', 'server.crt')
+KEY_PATH = os.path.join(os.path.dirname(__file__), 'dvnizk_ecc', 'certs', 'server.key')
 
 # Helper pour exécuter le handshake asynchrone
 def _perform_handshake(client, server):

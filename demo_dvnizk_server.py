@@ -26,8 +26,8 @@ from tlslite.utils.keyfactory import parsePEMKey
 from tlslite.constants import SignatureScheme
 
 # Chemins des certificats (relatifs à la racine du projet)
-CERT_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'dvnizk_ecc', 'certs', 'server.crt')
-KEY_PATH  = os.path.join(os.path.dirname(__file__), '..', '..', 'dvnizk_ecc', 'certs', 'server.key')
+CERT_PATH = os.path.join(os.path.dirname(__file__), 'dvnizk_ecc', 'certs', 'server.crt')
+KEY_PATH  = os.path.join(os.path.dirname(__file__), 'dvnizk_ecc', 'certs', 'server.key')
 
 SEP = "─" * 60
 
