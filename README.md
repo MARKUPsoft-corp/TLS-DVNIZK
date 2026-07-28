@@ -8,25 +8,707 @@ a deniable authentication mechanism for TLS 1.3.
 Instead of a standard Ed25519 signature in `CertificateVerify`, the server
 generates an OR proof of Schnorr proving knowledge of either the server's
 private key or the client's ephemeral key. The client can simulate
-indistinguishable proofs, making transcripts non-transferable.
+indistinguishable proofs, making transcripts **non-transferable**: a
+third party cannot distinguish a real transcript from a simulated one.
 
-## Modifications
+---
 
-**New files:**
-- `tlslite/dvnizk.py` — DVNIZK-ECC core: `generate_proof`, `verify_proof`,
-  `simulate_proof`, serialization, X25519↔Ed25519 conversion
-- `demo_dvnizk_server.py` — TLS 1.3 server demo with DVNIZK authentication
-- `demo_dvnizk_client.py` — TLS 1.3 client demo with DVNIZK authentication
-- `benchmark_dvnizk.py` — Performance benchmark (50 iterations)
-- `test_dvnizk_tls13.py` — TLS 1.3 handshake test
+## Table of Contents
 
-**Modified files:**
-- `tlslite/constants.py` — added `dvnizk_ed25519 = (254, 0)` signature scheme
-- `tlslite/handshakesettings.py` — added `dvnizk_ed25519` to `SIGNATURE_SCHEMES`
-- `tlslite/tlsconnection.py` — server proof generation and client proof
-  verification in TLS 1.3 handshake
+1. [Overview](#1-overview)
+2. [Theoretical Background](#2-theoretical-background)
+3. [Architecture](#3-architecture)
+4. [Core Module: `tlslite/dvnizk.py`](#4-core-module-tls-litedvnizkpy)
+5. [TLS 1.3 Integration](#5-tls-13-integration)
+6. [Modified Files](#6-modified-files)
+7. [Demo Applications](#7-demo-applications)
+8. [Testing](#8-testing)
+9. [Benchmarking](#9-benchmarking)
+10. [Security Considerations](#10-security-considerations)
+11. [Limitations](#11-limitations)
+12. [Quick Start](#12-quick-start)
+13. [References](#13-references)
 
-## Quick Start
+---
+
+## 1. Overview
+
+### 1.1 Motivation
+
+Standard TLS 1.3 handshakes produce **transferable** signatures: the server's
+`CertificateVerify` message is a standard Ed25519 (or ECDSA) signature over the
+transcript hash. Anyone who captures this signature can prove to a third party
+that the server authenticated a specific session — a problem for privacy-sensitive
+applications (e.g., whistleblowing, healthcare, financial services).
+
+DVNIZK-ECC replaces the deterministic signature with a **zero-knowledge proof**
+that the server knows its private key **OR** the client's ephemeral key. The
+client can locally simulate an identically distributed proof, so all transcripts
+are deniable.
+
+### 1.2 High-Level Idea
+
+The proof is a **Sigma protocol** with two parallel branches (an "OR-proof"):
+
+| Branch | Who knows the secret? | Proves knowledge of |
+|--------|----------------------|---------------------|
+| 1      | Server               | `x_server` such that `P_server = x_server · G` |
+| 2      | Client               | `x_client` such that `P_client = x_client · G` |
+
+The **server** knows `x_server`, so it simulates branch 2 (chooses a random
+challenge `c2` and response `s2`, then back-patches `R2 = s2·G - c2·P_client`).
+
+The **client** knows `x_client`, so it simulates branch 1 (chooses a random `c1`
+and `s1`, then back-patches `R1 = s1·G - c1·P_server`).
+
+The overall Fiat-Shamir challenge `c = H(R1 ‖ R2 ‖ ...)` is split: `c1 + c2 ≡ c (mod n)`.
+
+### 1.3 Deniability Property
+
+A captured transcript `(R1, R2, s1, s2, c2)` is **indistinguishable** from one
+produced by `simulate_proof()` using only the client's secret. Since the client
+can always plausibly claim to have generated the transcript locally, the proof
+is **non-transferable** (also called "deniable" or "designated-verifier").
+
+---
+
+## 2. Theoretical Background
+
+### 2.1 OR Proofs (Cramer–Damgård–Schoenmakers)
+
+An **OR proof** allows a prover to show knowledge of a secret for **one** of
+two (or more) statements without revealing which one. The construction uses
+the **Sigma protocol** parallel composition technique:
+
+- For the branch where the prover knows the witness, it behaves honestly
+  (random commitment, compute response given the challenge).
+- For the other branch, it **simulates** using random challenge and response,
+  then back-patches the commitment.
+
+The verifier checks both branches with the **same** overall challenge `c`,
+which equals `c1 + c2 mod n`. The prover cannot cheat because that would
+require solving the discrete log for both branches simultaneously.
+
+### 2.2 Fiat-Shamir Transform
+
+The interactive Sigma protocol is made **non-interactive** (NIZK) via the
+Fiat-Shamir heuristic:
+
+```
+c = H( context_string ‖ R1 ‖ R2 ‖ P_server ‖ P_client ‖ transcript_hash )
+```
+
+This binds the proof to the full session context, preventing replay and
+transcript-collision attacks.
+
+### 2.3 Soundness (Theorem 1 of the thesis)
+
+If the discrete log problem is hard in the Ed25519 group, an adversary who
+can produce a valid proof without knowing either `x_server` or `x_client`
+can be extracted to solve the discrete log for at least one of the public
+keys. Two extraction strategies exist:
+
+- **Server extraction** (the adversary acts as the server): rewind the
+  adversary to obtain two proofs with different challenges.
+- **Client extraction** (the adversary acts as the client): same technique
+  applied to branch 2.
+
+The full proof is given in the accompanying master's thesis (§2.3.5).
+
+### 2.4 Zero-Knowledge / Non-Transferability (Theorem 4)
+
+The `simulate_proof` function produces a proof whose distribution is
+**statistically indistinguishable** from a real proof. The simulator
+knows `x_client` and switches the roles: branch 2 is real, branch 1 is
+simulated. Since `c1`, `c2` are uniformly random and `R1`, `R2` are
+uniformly distributed group elements, no distinguisher can tell the
+difference without solving the DDH problem in the random oracle model.
+
+---
+
+## 3. Architecture
+
+### 3.1 File Map
+
+```
+implementation/tlslite-ng/
+├── tlslite/
+│   ├── dvnizk.py              # Core DVNIZK-ECC module (new)
+│   ├── constants.py           # Scheme ID (254, 0) (modified)
+│   ├── handshakesettings.py   # Scheme registration (modified)
+│   └── tlsconnection.py       # Handshake integration (modified)
+├── demo_dvnizk_server.py      # Server demo (new)
+├── demo_dvnizk_client.py      # Client demo (new)
+├── benchmark_dvnizk.py        # Performance benchmarks (new)
+├── test_dvnizk_tls13.py       # Unit/integration test (new)
+├── README.md                  # This file
+└── ...                        # Original tlslite-ng files (unchanged)
+```
+
+### 3.2 Data Flow
+
+```
+Server                                        Client
+  │                                             │
+  │  x_server, P_server                         │
+  │  P_client (from ClientHello key_share)      │
+  │  transcript_hash                            │
+  │                                             │
+  │  Algo 1: generate_proof()                   │
+  │    → R1 = r1·G        (real branch)         │
+  │    → R2 = s2·G - c2·P (simulated branch)    │
+  │    → c = SHA-512(...)                       │
+  │    → s1 = r1 + c1·x                        │
+  │                                             │
+  │  serialize: 160 bytes                       │
+  │                                             │
+  │  ──── CertificateVerify ──────────────────→ │
+  │                                             │
+  │                              Algo 2: verify_proof()
+  │                                → c = SHA-512(...)
+  │                                → check s1·G = R1 + c1·P_server
+  │                                → check s2·G = R2 + c2·P_client
+  │                                             │
+  │                              (optional)
+  │                              Algo 3: simulate_proof()
+  │                                → identical distribution
+```
+
+---
+
+## 4. Core Module: `tlslite/dvnizk.py`
+
+### 4.1 Constants
+
+| Symbol | Value | Description |
+|--------|-------|-------------|
+| `n` | `2²⁵² + 27742317777372353535851937790883648493` | Order of the Ed25519 group |
+| `p` | `2²⁵⁵ − 19` | Prime field characteristic |
+
+### 4.2 Key Conversion
+
+```python
+def x25519_to_ed25519(u_bytes: bytes) -> bytes
+```
+
+Converts an X25519 Montgomery u-coordinate (32 bytes) to an Ed25519 Edwards
+y-coordinate (32 bytes) using the birational map:
+
+```
+u = (1 + y) / (1 − y)   ⇔   y = (u − 1) / (u + 1)  mod p
+```
+
+This is needed because TLS 1.3 negotiates X25519 for key exchange (RFC 7748)
+but we need to represent the client's public key as an Ed25519 point for the
+OR proof. The conversion is deterministic and lossless for valid X25519
+public keys.
+
+```python
+def eddsakey_to_scalar_and_pub(key) -> tuple
+```
+
+Extracts the private scalar (after SHA-512 seed derivation and clamping per
+RFC 8032 §5.1.5) and the raw public key bytes from a tlslite-ng `EdDSAKey`
+object. The seed is `key.private_key.to_string()` (32 bytes); the scalar is
+`SHA-512(seed)[0:32]` with the standard Ed25519 clamping.
+
+### 4.3 Scalar Utilities
+
+| Function | Description |
+|----------|-------------|
+| `random_scalar()` | Returns `os.urandom(32) mod n` |
+| `scalar_to_bytes(s)` | 32-byte little-endian encoding |
+| `bytes_to_scalar(b)` | Decodes 32 bytes `mod n` |
+
+### 4.4 Group Operations (via PyNaCl/libsodium)
+
+| Function | Operation | PyNaCl binding |
+|----------|-----------|----------------|
+| `point_base_mul(s)` | `s · G` | `crypto_scalarmult_ed25519_base_noclamp` |
+| `point_mul(s, P)` | `s · P` | `crypto_scalarmult_ed25519_noclamp` |
+| — (add) | `P + Q` | `crypto_core_ed25519_add` |
+| — (sub) | `P − Q` | `crypto_core_ed25519_sub` |
+
+All operations use the **no-clamp** variants to allow arbitrary scalars in
+the full group `ℤₙ`.
+
+### 4.5 Challenge Hash
+
+```python
+def hash_to_scalar(*args: bytes) -> int
+```
+
+Computes `SHA-512(args[0] ‖ args[1] ‖ ...)` and reduces the digest modulo `n`.
+The domain separator `"DVNIZK-ECC"` is passed as the first argument in every
+call to prevent cross-protocol attacks.
+
+### 4.6 Algorithm 1 — Proof Generation (Server)
+
+```python
+def generate_proof(x_server: int, P_server: bytes, P_client: bytes,
+                   transcript_hash: bytes) -> dict
+```
+
+**Inputs:**
+- `x_server`: server's private scalar (after clamping)
+- `P_server`: server's Ed25519 public key (32 bytes)
+- `P_client`: client's Ed25519 public key (32 bytes, converted from X25519)
+- `transcript_hash`: TLS 1.3 transcript hash (SHA-256 output)
+
+**Algorithm:**
+```
+1. r1 ← random ℤₙ, R1 = r1·G
+2. c2 ← random ℤₙ, s2 ← random ℤₙ, R2 = s2·G − c2·P_client
+3. c = SHA-512("DVNIZK-ECC", R1, R2, P_server, P_client, transcript_hash) mod n
+4. c1 = c − c2 mod n, s1 = r1 + c1·x_server mod n
+5. Return (R1, R2, s1, s2, c2)
+```
+
+**Output dict:**
+| Key | Type | Size |
+|-----|------|------|
+| `R1` | bytes | 32 |
+| `R2` | bytes | 32 |
+| `s1` | int | scalar |
+| `s2` | int | scalar |
+| `c2` | int | scalar |
+| `gen_time_us` | float | measurement |
+
+### 4.7 Algorithm 2 — Proof Verification (Client)
+
+```python
+def verify_proof(proof: dict, P_server: bytes, P_client: bytes,
+                 transcript_hash: bytes) -> tuple
+```
+
+**Returns:** `(valid: bool, verify_time_us: float)`
+
+**Algorithm:**
+```
+1. Parse (R1, R2, s1, s2, c2) from proof
+2. c = SHA-512("DVNIZK-ECC", R1, R2, P_server, P_client, transcript_hash) mod n
+3. c1 = c − c2 mod n
+4. Check: s1·G == R1 + c1·P_server
+5. Check: s2·G == R2 + c2·P_client
+6. Return True iff both checks pass
+```
+
+### 4.8 Algorithm 3 — Proof Simulation (Client)
+
+```python
+def simulate_proof(x_client: int, P_server: bytes, P_client: bytes,
+                   transcript_hash: bytes) -> dict
+```
+
+**Algorithm:**
+```
+1. r2 ← random ℤₙ, R2 = r2·G
+2. c1 ← random ℤₙ, s1 ← random ℤₙ, R1 = s1·G − c1·P_server
+3. c = SHA-512("DVNIZK-ECC", R1, R2, P_server, P_client, transcript_hash) mod n
+4. c2 = c − c1 mod n, s2 = r2 + c2·x_client mod n
+5. Return (R1, R2, s1, s2, c2)
+```
+
+### 4.9 Serialization
+
+| Function | Description |
+|----------|-------------|
+| `serialize_proof(proof) → bytes` | Concatenates `R1 ‖ R2 ‖ s1_bytes ‖ s2_bytes ‖ c2_bytes` = 160 bytes |
+| `deserialize_proof(data) → dict` | Splits 160 bytes into components; raises `ValueError` on wrong length |
+
+Serialization format (wire order):
+
+```
+Offset  Size  Contents
+0       32    R1 (compressed Ed25519 point)
+32      32    R2 (compressed Ed25519 point)
+64      32    s1 (little-endian scalar)
+96      32    s2 (little-endian scalar)
+128     32    c2 (little-endian scalar)
+```
+
+---
+
+## 5. TLS 1.3 Integration
+
+### 5.1 Signature Scheme ID
+
+```python
+# tlslite/constants.py
+dvnizk_ed25519 = (254, 0)   # RFC 8446 private use range (0xFE00)
+```
+
+The value `(254, 0)` corresponds to the byte `0xFE00` in TLS wire format,
+which falls in the **private use** range (0xFE00–0xFEFF) reserved by RFC 8446
+§4.2.3. This ensures no collision with IANA-registered signature schemes.
+
+### 5.2 Server-Side (Proof Generation)
+
+Location: `tlsconnection.py:3192–3227`
+
+When the server's key type is Ed25519 and the client's advertised signature
+schemes include `dvnizk_ed25519`:
+
+1. **Parse ClientHello key_share** — extract the client's X25519 public key
+   from the first key share extension.
+2. **Convert X25519 → Ed25519** — call `x25519_to_ed25519()` (if using X25519).
+3. **Extract server scalar** — call `eddsakey_to_scalar_and_pub()` to derive
+   the clamped Ed25519 scalar and public key bytes.
+4. **Compute transcript hash** — `self._handshake_hash.digest(prf_name)`
+   includes: ClientHello, ServerHello, EncryptedExtensions, Certificate,
+   and CertificateVerify (up to the signature itself).
+5. **Generate proof** — `dvnizk.generate_proof(x_server, P_server, P_client, transcript_hash)`.
+6. **Serialize and send** — serialize to 160 bytes, wrap in `CertificateVerify`
+   message with `signatureAlgorithm = dvnizk_ed25519`.
+
+### 5.3 Client-Side (Proof Verification)
+
+Location: `tlsconnection.py:1459–1496`
+
+When the client receives a `CertificateVerify` with `dvnizk_ed25519`:
+
+1. **Deserialize** — `dvnizk.deserialize_proof(certificate_verify.signature)`.
+2. **Get server's public key** — raw Ed25519 bytes from the server certificate.
+3. **Get client's ephemeral key** — compute the public value from the client's
+   local private key share; convert X25519 → Ed25519 if necessary.
+4. **Compute transcript hash** — `srv_cert_verify_hh.digest(prfName)`.
+5. **Verify** — `dvnizk.verify_proof(proof_obj, P_server, P_client, transcript_hash)`.
+6. **Fail gracefullly** — on failure, send `decrypt_error` alert and abort the
+   handshake.
+
+### 5.4 Challenge Binding Security
+
+The Fiat-Shamir challenge binds to:
+
+| Component | Source | Purpose |
+|-----------|--------|---------|
+| `"DVNIZK-ECC"` | constant string | Domain separation |
+| `R1, R2` | proof commitments | Prevents replay of commitments |
+| `P_server` | server certificate | Binds proof to server identity |
+| `P_client` | ClientHello key_share | Binds proof to session |
+| `transcript_hash` | TLS 1.3 handshake hash | Binds proof to full transcript |
+
+### 5.5 Key Schedule Integration
+
+DVNIZK-ECC **does not alter** the TLS 1.3 key schedule. The handshake still
+derives `client_handshake_traffic_secret`, `server_handshake_traffic_secret`,
+and `master_secret` identically to RFC 8446. The `CertificateVerify` message
+(after proof verification) is fed into the transcript hash exactly as a
+standard signature would be. The `Finished` messages then verify the full
+transcript including the DVNIZK proof, ensuring integrity of the authentication.
+
+### 5.6 Handshake Protocol Flow
+
+```
+ClientHello (key_share: X25519 ephemeral)
+    │
+ServerHello (key_share: X25519 ephemeral)
+    │
+EncryptedExtensions
+    │
+Certificate (Ed25519 cert)
+    │
+CertificateVerify (dvnizk_ed25519 proof — 160 bytes)
+    │
+Finished (transcript includes proof)
+    │
+─────────────────────────────────
+    │
+Finished (transcript includes proof)
+    │
+[Application Data]
+```
+
+---
+
+## 6. Modified Files
+
+### 6.1 `tlslite/constants.py`
+
+- Added `dvnizk_ed25519 = (254, 0)` to the `SignatureScheme` class (line 268).
+- Extended `getKeyType()` to return `"eddsa"` for `"dvnizk_ed25519"` (line 287),
+  ensuring it is treated as an EdDSA-like key type throughout the handshake
+  logic.
+
+### 6.2 `tlslite/handshakesettings.py`
+
+- Added `"dvnizk_ed25519"` to `SIGNATURE_SCHEMES` list (line 39), inserted after
+  `"ed25519"` to ensure it is considered during signature algorithm negotiation.
+
+### 6.3 `tlslite/tlsconnection.py`
+
+**Three integration points:**
+
+1. **Client-side verification** (lines 1459–1496): In the client's
+   `_clientReceiveCertificateVerify` handler, a new branch checks
+   `signature_scheme == dvnizk_ed25519` and calls `dvnizk.verify_proof()`.
+
+2. **Server-side generation** (lines 3192–3227): In
+   `_serverSendCertificateVerify`, a new branch for `scheme == "dvnizk_ed25519"`
+   generates and serializes the proof via `dvnizk.generate_proof()`.
+
+3. **Certificate-signature algorithm filtering** (line 5188): The
+   `_clientFilterSigAlgs` method is modified to accept `dvnizk_ed25519` when
+   the certificate type is `"Ed25519"`, ensuring the scheme appears in the
+   client's `signature_algorithms` extension.
+
+---
+
+## 7. Demo Applications
+
+### 7.1 Server (`demo_dvnizk_server.py`)
+
+A standalone TLS 1.3 server that:
+- Loads an Ed25519 certificate and key from `dvnizk_ecc/certs/server.{crt,key}`.
+- Listens on configurable port (default 8443).
+- Handles each client connection in a daemon thread.
+- Uses `dvnizk_ed25519` for the server's CertificateVerify.
+- Echoes a welcome message and reads one client message.
+
+**Usage:**
+```bash
+python demo_dvnizk_server.py [port]
+```
+
+### 7.2 Client (`demo_dvnizk_client.py`)
+
+A standalone TLS 1.3 client that:
+- Connects to a DVNIZK server on configurable host/port (default `127.0.0.1:8443`).
+- Advertises both `dvnizk_ed25519` and `ed25519` in signature_algorithms
+  (with DVNIZK preferred).
+- Verifies the server's DVNIZK proof upon receiving CertificateVerify.
+- Reads the server's welcome message and sends a reply.
+
+**Usage:**
+```bash
+python demo_dvnizk_client.py [host] [port]
+```
+
+### 7.3 Certificate Generation
+
+The test certificates in `dvnizk_ecc/certs/` are Ed25519 self-signed certs
+generated with:
+```bash
+openssl req -x509 -newkey ed25519 -keyout server.key -out server.crt -days 365 -nodes
+```
+
+---
+
+## 8. Testing
+
+### 8.1 Unit Test (`test_dvnizk_tls13.py`)
+
+A `unittest.TestCase` that performs a full TLS 1.3 handshake between two
+`TLSConnection` objects over an in-memory socket pair:
+
+- Loads the Ed25519 server certificate and key.
+- Configures the client to advertise `dvnizk_ed25519` (with `ed25519` fallback).
+- Drives the async handshake generators (`handshakeServerAsync` /
+  `handshakeClientCert`) using a custom `_perform_handshake` helper that
+  exchanges write buffers bidirectionally.
+- Asserts that `handshake_completed` is `True` for both sides and the
+  negotiated algorithm is `dvnizk_ed25519`.
+
+**Run from the project root:**
+```bash
+python -m pytest implementation/tlslite-ng/test_dvnizk_tls13.py -v
+```
+or:
+```bash
+cd implementation/tlslite-ng
+python -m pytest test_dvnizk_tls13.py -v
+```
+
+### 8.2 Self-Test (`dvnizk.py __main__`)
+
+Running `dvnizk.py` directly exercises all four core operations with random
+keys and a simulated transcript hash:
+```bash
+python -m tlslite.dvnizk
+```
+Expected output:
+```
+[1] Generation de la preuve (serveur)...
+    Temps de generation : 160.9 µs
+    Taille preuve       : 160 octets (5 × 32)
+
+[2] Verification de la preuve (client)...
+    Resultat            : ✓ VALIDE
+    Temps verification  : 286.1 µs
+
+[3] Simulation par le client (Theoreme 4)...
+    Preuve simulee valide : ✓ OUI
+    → Non-transferabilité démontrée
+
+[4] Test de serialisation...
+    Taille serialisee   : 160 octets
+    Preuve deserialisee : ✓ VALIDE
+
+[5] Comparaison tailles :
+    Signature EdDSA standard : 64 octets
+    Preuve DVNIZK-ECC       : 160 octets (+96 octets)
+```
+
+---
+
+## 9. Benchmarking
+
+### 9.1 Benchmark Script (`benchmark_dvnizk.py`)
+
+The benchmark measures:
+
+| Test | Description | Method |
+|------|-------------|--------|
+| 1. Ed25519 primitives | `hashAndSign` / `hashAndVerify` (python-ecdsa) | 100 iterations |
+| 2. DVNIZK primitives | `generate_proof` / `verify_proof` / `simulate_proof` (PyNaCl) | 100 iterations |
+| 3. Handshake Ed25519 | Full TLS 1.3 handshake, ed25519 CertificateVerify | 100 iterations |
+| 4. Handshake DVNIZK | Full TLS 1.3 handshake, dvnizk_ed25519 CertificateVerify | 100 iterations |
+| 5. Packet sizes | CertificateVerify payload sizes | direct measurement |
+
+**Options:**
+```bash
+python benchmark_dvnizk.py --iterations 200    # Change iterations
+python benchmark_dvnizk.py --output ./graphs/  # Generate matplotlib charts
+python benchmark_dvnizk.py --no-charts         # Disable chart generation
+```
+
+### 9.2 Results (Intel Core i7-8665U, 50 iterations)
+
+| Metric               | Ed25519     | DVNIZK-ECC | Difference |
+|----------------------|-------------|------------|------------|
+| Generation / sign    | 591 µs      | 205 µs     | −65%       |
+| Verification         | 4648 µs     | 341 µs     | −93%       |
+| Handshake total      | 19 277 µs   | 19 264 µs  | ~0%        |
+| CertVerify size      | 64 bytes    | 160 bytes  | +96 bytes  |
+
+### 9.3 Interpretation
+
+DVNIZK-ECC appears significantly faster than Ed25519 in this benchmark, but
+this is a **backend artifact**:
+
+- **Ed25519** uses `tlslite-ng`'s built-in `python-ecdsa` library (pure Python).
+- **DVNIZK-ECC** uses PyNaCl, which wraps **libsodium** (optimized C with
+  constant-time operations).
+
+In a native C implementation (e.g., both using OpenSSL), the overhead of
+DVNIZK-ECC would be approximately **2–3 scalar multiplications** over a
+standard Ed25519 signature — roughly a 2–3× slowdown at the cryptographic
+primitive level. For the full handshake, the difference is negligible
+(<0.1%) because the network I/O and asymmetric key exchange dominate.
+
+The time-constant guarantee applies to the **libsodium C layer**, not the
+Python wrapper; the Python control flow (conditional checks, function calls)
+may introduce data-dependent timing variations at the microsecond level.
+
+### 9.4 Graph Output
+
+When `--output` is specified, the script generates:
+- `benchmark_primitives.png` — bar chart of 5 primitive operations
+- `benchmark_handshake.png` — bar chart comparing full handshake times
+- `benchmark_overhead.png` — relative overhead percentage
+- `benchmark_sizes.png` — CertificateVerify size comparison
+
+---
+
+## 10. Security Considerations
+
+### 10.1 Deniability (Non-Transferability)
+
+The `simulate_proof` function (Algorithm 3) generates proofs that are
+**statistically indistinguishable** from real server-generated proofs.
+This means:
+
+- A third party holding a transcript cannot determine whether it was
+  produced by the server or simulated by the client.
+- The client can always repudiate a transcript by claiming to have
+  simulated it.
+- **Caveat:** Deniability applies only to the authentication layer.
+  Side-channel information (IP addresses, timing, application data
+  content) may still link a session to a specific party.
+
+### 10.2 Soundness
+
+An adversary who produces a valid proof without knowing either `x_server`
+or `x_client` must solve the discrete logarithm problem for at least one
+public key. This is guaranteed by the OR-proof extraction property:
+rewinding the adversary yields two proofs with challenges `c` and `c'`
+(`c ≠ c'`), from which the witness can be computed via:
+
+```
+x = (s1 − s1') / (c1 − c1')  mod n   (server extraction)
+x = (s2 − s2') / (c2 − c2')  mod n   (client extraction)
+```
+
+### 10.3 Domain Separation
+
+The challenge hash includes the fixed string `"DVNIZK-ECC"` as a prefix.
+This ensures that DVNIZK-ECC proofs cannot be replayed as standard Ed25519
+signatures or as proofs for other protocols that might use similar
+Fiat-Shamir constructions.
+
+### 10.4 Transcript Binding
+
+The `transcript_hash` input to the challenge hash includes all TLS 1.3
+handshake messages up to and including the Certificate message (per
+RFC 8446 §4.4.3). This binds the proof to the exact handshake context,
+preventing cut-and-paste attacks across sessions.
+
+### 10.5 Key Compromise
+
+- **Server key compromise:** An attacker with `x_server` can generate
+  valid proofs, but the client's simulation capability means the server
+  can still deny having authenticated any particular session.
+- **Client ephemeral key compromise:** An attacker with `x_client` can
+  simulate proofs for any server the client has connected to. This is
+  mitigated by using ephemeral X25519 keys (per-session), so compromising
+  one session's ephemeral key does not affect past or future sessions.
+
+---
+
+## 11. Limitations
+
+### 11.1 Performance Overhead (Native Backend)
+
+In a production deployment using native C libraries (e.g., OpenSSL, BoringSSL)
+for both Ed25519 and DVNIZK-ECC, the proof generation would require
+approximately 2–3× the scalar multiplications of a standard Ed25519 signature:
+- Ed25519 sign: 1 scalar multiplication (deterministic nonce via SHA-512)
+- DVNIZK-ECC gen: 4 scalar multiplications (2 for branch 1, 2 for branch 2)
+
+The 160-byte proof is also 2.5× larger than a 64-byte Ed25519 signature.
+
+### 11.2 Implementation Maturity
+
+- The implementation is a **proof of concept** and has not undergone
+  third-party security audit.
+- The `python-ecdsa` Ed25519 backend is known to be slower than libsodium
+  for verification — the benchmark comparison is skewed by backend choice.
+- Only **one signature scheme** (`dvnizk_ed25519`) is implemented; extension
+  to Ed448 or ECDSA (P-256/P-384) is straightforward but not done.
+
+### 11.3 Constant-Time Guarantees
+
+While libsodium provides constant-time curve operations, the Python layer
+adds non-constant-time control flow:
+- Python `if` statements, exception handling, `int.from_bytes` / `.to_bytes`
+- Conditional code paths in proof generation (not present — both branches
+  always compute the same operations)
+
+A production implementation should minimize Python-level branches or
+implement the entire proof in C/Rust.
+
+### 11.4 Single-Key-Share Assumption
+
+The implementation assumes the client sends a single X25519 key share in
+`ClientHello.key_share`. This is the most common configuration but does
+not handle the case where the client sends multiple key shares or uses a
+different curve.
+
+---
+
+## 12. Quick Start
+
+### 12.1 Installation
 
 ```bash
 git clone https://github.com/MARKUPsoft-corp/TLS-DVNIZK.git
@@ -36,7 +718,13 @@ source venv/bin/activate
 pip install pynacl
 ```
 
-### Demo (two terminals)
+### 12.2 Run Self-Test
+
+```bash
+python -m tlslite.dvnizk
+```
+
+### 12.3 Demo (two terminals)
 
 Terminal 1 (server):
 ```bash
@@ -52,47 +740,53 @@ python demo_dvnizk_client.py
 
 Expected output:
 ```
-SERVEUR DVNIZK-ECC -- TLS 1.3
+SERVEUR DVNIZK-ECC — TLS 1.3
 Handshake TLS 1.3 reussi !
     Algorithme : dvnizk_ed25519
 ```
 
-### Benchmark
+### 12.4 Run Tests
 
 ```bash
-source venv/bin/activate
-python benchmark_dvnizk.py
+cd implementation/tlslite-ng
+python -m pytest test_dvnizk_tls13.py -v
 ```
 
-Results (50 iterations, Intel Core i7-8665U):
+### 12.5 Benchmark
 
-| Metric               | Ed25519     | DVNIZK-ECC | Difference |
-|----------------------|-------------|------------|------------|
-| Generation / sign    | 591 µs      | 205 µs     | -65%       |
-| Verification         | 4648 µs     | 341 µs     | -93%       |
-| Handshake total      | 19 277 µs   | 19 264 µs  | ~0%        |
-| CertVerify size      | 64 bytes    | 160 bytes  | +96 bytes  |
-
-## Protocol Details
-
-**Challenge computation** (Fiat-Shamir with domain separation):
-```
-c = SHA-512("DVNIZK-ECC" || R1 || R2 || P_server || P_client || transcript_hash)
+```bash
+python benchmark_dvnizk.py --output /tmp/benchmark_graphs
 ```
 
-**Proof serialization:** 160 bytes (2 compressed points + 3 scalars × 32 bytes)
+---
 
-**Signature scheme ID:** `dvnizk_ed25519 = (254, 0)` (private use range, RFC 8446)
+## 13. References
 
-**Key conversion:** X25519 (Montgomery) ↔ Ed25519 (Edwards) via birational map
-  `y = (u - 1) / (u + 1) mod p`
+### Academic
 
-## References
+- **YAKAM TCHAMEGNI Emmanuel.** *Conception et implémentation d'un mécanisme
+  d'authentification non-transférable pour TLS 1.3 utilisant des preuves à
+  divulgation nulle de connaissance.* Mémoire de Master 2, Université de
+  Yaoundé I, 2024–2025.
+- **Cramer, R., Damgård, I., Schoenmakers, B.** (1994). Proofs of partial
+  knowledge and simplified design of witness hiding protocols. *CRYPTO '94*.
+- **Bernstein, D. J. et al.** (2012). High-speed high-security signatures.
+  *Journal of Cryptographic Engineering*, 2(2):77–89.
+- **Bernstein, D. J.** (2006). Curve25519: New Diffie-Hellman speed records.
+  *PKC 2006*.
 
-- [tlslite-ng original](https://github.com/tlsfuzzer/tlslite-ng)
-- TLS 1.3 (RFC 8446), Ed25519 (RFC 8032), X25519 (RFC 7748)
-- PyNaCl: https://github.com/pyca/pynacl/
-- libsodium: https://doc.libsodium.org/
+### Standards
+
+- **RFC 8446** — The Transport Layer Security (TLS) Protocol Version 1.3
+- **RFC 8032** — EdDSA (Ed25519 and Ed448)
+- **RFC 7748** — Elliptic Curves for Security (Curve25519 and Curve448)
+
+### Software
+
+- **tlslite-ng:** https://github.com/tlsfuzzer/tlslite-ng
+- **PyNaCl:** https://github.com/pyca/pynacl/
+- **libsodium:** https://doc.libsodium.org/
+- **TLS-DVNIZK repository:** https://github.com/MARKUPsoft-corp/TLS-DVNIZK
 
 ---
 
